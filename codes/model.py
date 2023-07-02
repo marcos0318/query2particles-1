@@ -358,6 +358,8 @@ class Intersection(nn.Module):
 
 
 
+
+
 class Query2Particles(nn.Module):
     def __init__(self, nentity, nrelation,
                  entity_space_dim,
@@ -1120,6 +1122,709 @@ class Query2Particles(nn.Module):
         return logs_new, logs_tradition
 
 
+
+class TLQE(Query2Particles):
+
+    def __init__(self, nentity, nrelation, entity_space_dim, num_particles=2, dropout_rate=0.2, label_smoothing=0.1):
+        super().__init__(nentity, nrelation, entity_space_dim, num_particles, dropout_rate, label_smoothing)
+
+        embedding_size = entity_space_dim
+        self.operation_embedding = nn.Embedding(3, embedding_size)
+
+        self.sigmoid = nn.Sigmoid()
+        self.tanh = nn.Tanh()
+
+        self.W_i = nn.Linear(embedding_size, embedding_size)
+        self.U_i = nn.Linear(embedding_size, embedding_size)
+
+        self.W_f = nn.Linear(embedding_size, embedding_size)
+        self.U_f = nn.Linear(embedding_size, embedding_size)
+
+        self.W_o = nn.Linear(embedding_size, embedding_size)
+        self.U_o = nn.Linear(embedding_size, embedding_size)
+
+        self.W_u = nn.Linear(embedding_size, embedding_size)
+        self.U_u = nn.Linear(embedding_size, embedding_size)
+
+        self.relation_embedding = self.relation_transition_embedding
+
+    
+    def op_to_particles(self, x):
+
+        return x
+
+
+    def op_higher_projection(self, sub_query_encoding, relation_ids):
+        return self.op_projection(sub_query_encoding, relation_ids)
+    
+    def op_projection(self, sub_query_encoding, relation_embedding):
+
+        # [batch_size, embedding_size]
+        if len(sub_query_encoding.shape) == 2:
+            prev_h = sub_query_encoding
+            prev_c = torch.zeros_like(prev_h)
+
+        else:
+            prev_h = sub_query_encoding[:, 0, :]
+            prev_c = sub_query_encoding[:, 1, :]
+
+
+
+        # relation_ids = torch.tensor(relation_ids)
+        # relation_ids = relation_ids.to(self.relation_embedding.weight.device)
+        # x = self.relation_embedding(relation_ids)
+
+        x = relation_embedding
+        
+        i = self.sigmoid(self.W_i(x) + self.U_i(prev_h))
+        f = self.sigmoid(self.W_f(x) + self.U_f(prev_h))
+        o = self.sigmoid(self.W_o(x) + self.U_o(prev_h))
+        u = self.tanh(self.W_u(x) + self.U_u(prev_h))
+
+        next_c = f * prev_c + i * u
+        next_h = o * self.tanh(next_c)
+
+        return torch.stack((next_h, next_c), dim=1)
+
+
+    def op_intersection(self, all_subquery_encodings):
+        """
+
+        :param sub_query_encoding_list: a list of the sub-query embeddings of size [batch_size, embedding_size]
+        :return:  [batch_size, embedding_size]
+        """
+
+        # [batch_size, number_sub_queries, 2, embedding_size]
+        # all_subquery_encodings = torch.stack(sub_query_encoding_list, dim=1)
+
+        # [batch_size, embedding_size]
+        prev_h = all_subquery_encodings[:, :, 0, :].sum(dim=1)
+
+        # [batch_size, number_sub_queries, embedding_size]
+        c_k = all_subquery_encodings[:, :, 1, :]
+
+        x = self.operation_embedding(
+            torch.zeros(all_subquery_encodings.shape[0]).long().to(self.operation_embedding.weight.device)
+        )
+
+        i = self.sigmoid(self.W_i(x) + self.U_i(prev_h))
+
+        # [batch_size, number_sub_queries, embedding_size]
+        f_k = self.sigmoid( self.W_f(all_subquery_encodings[:, :, 0, :]) + self.U_f(prev_h).unsqueeze(1))
+
+        o = self.sigmoid(self.W_o(x) + self.U_o(prev_h))
+
+        u = self.tanh(self.W_u(x) + self.U_u(prev_h))
+
+
+        next_c = torch.sum(f_k * c_k, dim=1) + i * u
+
+        next_h = o * self.tanh(next_c)
+
+
+        return torch.stack((next_h, next_c), dim=1)
+
+    def op_union(self, all_subquery_encodings):
+        return self.op_intersection(all_subquery_encodings)
+
+
+    def op_complement(self, sub_query_encoding):
+
+        # [batch_size, 2, embedding_size]
+
+        prev_h = sub_query_encoding[:, 0, :]
+        prev_c = sub_query_encoding[:, 1, :]
+
+        operation_ids = torch.tensor(2).to(self.operation_embedding.weight.device).unsqueeze(0)
+        x = self.operation_embedding(operation_ids)
+
+        
+        i = self.sigmoid(self.W_i(x) + self.U_i(prev_h))
+        f = self.sigmoid(self.W_f(x) + self.U_f(prev_h))
+        o = self.sigmoid(self.W_o(x) + self.U_o(prev_h))
+        u = self.tanh(self.W_u(x) + self.U_u(prev_h))
+
+        next_c = f * prev_c + i * u
+        next_h = o * self.tanh(next_c)
+
+        return torch.stack((next_h, next_c), dim=1)
+
+
+
+    def forward(self, batch_queries, qtype, inverted=False):
+        """
+        :param positive_sample: [batch_size]
+        :param negative_sample: [batch_size, num_negative_sample]
+        :param batch_queries: [batch_size, query_length]
+        :param qtype: str
+
+        :return: positive_likelihoods, negative_likelihoods,  particles, weights
+        positive_likelihoods: [batch_size, 1]
+        negative_likelihoods: [batch_size, num_negative_sample]
+
+        """
+
+        if qtype == "1p":
+
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # Forward propagation
+            particles= self.op_to_particles(entity_1)
+
+            particles= self.op_projection(particles, relation_transition_1)
+
+        elif qtype == "2u-arg":
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            batch_size, embedding_size = relation_transition_1.shape
+
+            permutation_index = torch.randperm(batch_size)
+
+            # Forward propagation
+            # [batch_size, num_particles, embedding_size]
+            particles = self.op_to_particles(entity_1)
+
+            permuted_particles = particles[permutation_index]
+            permuted_relations = relation_transition_1[permutation_index]
+
+            # [batch_size, num_particles, embedding_size]
+            particles = self.op_projection(particles, relation_transition_1)
+            permuted_particles = self.op_projection(permuted_particles, permuted_relations)
+
+            # [batch_size, 2 * num_particles, embedding_size]
+            particles = torch.cat([particles, permuted_particles], dim=1)
+
+
+
+        elif qtype == "2p":
+            # positive sample is of shape [batch_size, 4], [entity1_id, rel_id1, rel_id2, answer_id]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 2])
+
+            # Forward propagation
+            particles = self.op_to_particles(entity_1)
+
+            particles = self.op_projection(particles,
+                                                    relation_transition_1)
+
+            particles = self.op_higher_projection(particles,
+                                                    relation_transition_2)
+
+        elif qtype == "3p":
+
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_3 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            # Forward propagation
+            particles = self.op_to_particles(entity_1)
+
+            particles = self.op_projection(particles, relation_transition_1)
+
+            particles = self.op_higher_projection(particles, relation_transition_2)
+
+            particles = self.op_higher_projection(particles, relation_transition_3)
+
+
+        elif qtype == "2i":
+            # [batch_size, embedding_size]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1)
+
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+
+            # [batch_size, embedding_size, num_particles] ->
+            # [ batch_size, num_sets, embedding_size, num_particles]
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+
+            particles = self.op_intersection(sets_of_particles)
+
+
+        elif qtype == "3i":
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            entity_3 = self.entity_embedding(batch_queries[:, 4])
+
+            # [batch_size, embedding_size]
+            relation_transition_3 = self.relation_transition_embedding(batch_queries[:, 5])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+            particles_3 = self.op_to_particles(entity_3)
+
+            particles_3 = self.op_projection(particles_3, relation_transition_3)
+
+
+            sets_of_particles = torch.stack([particles_1, particles_2, particles_3], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+
+        elif qtype == "2in":
+
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+            # complement operation here
+            particles_2 = self.op_complement(particles_2)
+
+
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+
+        elif qtype == "3in":
+
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            entity_3 = self.entity_embedding(batch_queries[:, 4])
+
+            # [batch_size, embedding_size]
+            relation_transition_3 = self.relation_transition_embedding(batch_queries[:, 5])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+            particles_3 = self.op_to_particles(entity_3)
+
+            particles_3 = self.op_projection(particles_3, relation_transition_3)
+
+            # Only the third projection is taken complement
+            particles_3 = self.op_complement(particles_3)
+
+            sets_of_particles = torch.stack([particles_1, particles_2, particles_3], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+
+        elif qtype == "inp":
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_2 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 5])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1_1)
+
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_1_2)
+
+            # complement before the intersection
+            particles_2 = self.op_complement(particles_2)
+
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+            particles = self.op_higher_projection(particles, relation_transition_2)
+
+
+        elif qtype == "pin":
+            # [batch_size, embedding_size]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_2 = self.relation_transition_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 4])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1_1)
+
+            particles_1 = self.op_higher_projection(particles_1, relation_transition_1_2)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+            particles_2 = self.op_complement(particles_2)
+
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+        elif qtype == "pni":
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_2 = self.relation_transition_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 4])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 5])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1= self.op_projection(particles_1, relation_transition_1_1)
+
+            particles_1 = self.op_higher_projection(particles_1, relation_transition_1_2)
+
+            particles_1 = self.op_complement(particles_1)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+
+        # the rest of data types are not trained before
+
+        elif qtype == "ip":
+            # [batch_size, embedding_size]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_2 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 4])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1_1)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_1_2)
+
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+            particles = self.op_higher_projection(particles, relation_transition_2)
+
+
+        elif qtype == "pi":
+            # [batch_size, embedding_size]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_2 = self.relation_transition_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 4])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1_1)
+
+            particles_1 = self.op_higher_projection(particles_1, relation_transition_1_2)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+
+        elif qtype == "2u-DNF":
+
+
+
+            # [batch_size, embedding_size]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1)
+
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+
+            # [batch_size, embedding_size, num_particles] ->
+            # [ batch_size, num_sets, embedding_size, num_particles]
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+
+            particles = self.op_intersection(sets_of_particles)
+
+
+
+        elif qtype == "up-DNF":
+            # [batch_size, embedding_size]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 2])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_2 = self.relation_transition_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 5])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1_1)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_1_2)
+
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+            particles = self.op_higher_projection(particles, relation_transition_2)
+
+        elif qtype == "2u-DM":
+
+
+            # [batch_size, embedding_size]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 4])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1)
+
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_2)
+
+
+            # [batch_size, embedding_size, num_particles] ->
+            # [ batch_size, num_sets, embedding_size, num_particles]
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+
+            particles = self.op_intersection(sets_of_particles)
+
+
+        
+        elif qtype == "up-DM":
+            # [batch_size, embedding_size]
+            entity_1 = self.entity_embedding(batch_queries[:, 0])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_1 = self.relation_transition_embedding(batch_queries[:, 1])
+
+            # [batch_size, embedding_size]
+            entity_2 = self.entity_embedding(batch_queries[:, 3])
+
+            # [batch_size, embedding_size]
+            relation_transition_1_2 = self.relation_transition_embedding(batch_queries[:, 4])
+
+            # [batch_size, embedding_size]
+            relation_transition_2 = self.relation_transition_embedding(batch_queries[:, 7])
+
+            particles_1 = self.op_to_particles(entity_1)
+
+            particles_1 = self.op_projection(particles_1, relation_transition_1_1)
+
+            particles_2 = self.op_to_particles(entity_2)
+
+            particles_2 = self.op_projection(particles_2, relation_transition_1_2)
+
+            sets_of_particles = torch.stack([particles_1, particles_2], dim=1)
+
+            particles = self.op_intersection(sets_of_particles)
+
+            particles = self.op_higher_projection(particles, relation_transition_2)
+
+        else:
+            raise ValueError('query type %s not supported' % qtype)
+
+
+        all_prediction_scores = self.decoder(particles[:, 0, :])
+
+
+        return all_prediction_scores
+
+    @staticmethod
+    def train_step(model, iter, optimizer, use_apex):
+        model.train()
+        optimizer.zero_grad()
+        positive_sample, _, subsampling_weight, batch_queries, query_structures = next(iter)
+        positive_sample = torch.tensor(positive_sample).cuda()
+        batch_queries = torch.tensor(batch_queries).cuda()
+
+        qtype = query_name_dict[query_structures[0]]
+
+      
+        try:
+            label_smoothing = model.label_smoothing
+        except:
+            label_smoothing = model.module.label_smoothing
+
+        prediction_scores = model(batch_queries, qtype)
+
+
+        loss_fct = LabelSmoothingLoss(smoothing=label_smoothing, reduction='none')
+        masked_lm_loss = loss_fct(prediction_scores, positive_sample.view(-1))
+
+        loss = (masked_lm_loss).mean()
+
+        if use_apex:
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+                optimizer.step()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        log = {
+            'qtype': qtype,
+            'loss': loss.item(),
+        }
+
+        return log
+
+
+
+    
+
+
 def test_dataloading_new(data_path="../data/FB15k-237-betae"):
     print("start open")
     with open('%s/stats.txt' % data_path) as f:
@@ -1137,7 +1842,7 @@ def test_dataloading_new(data_path="../data/FB15k-237-betae"):
 
 
     print("Cuda start")
-    model = Query2Particles(nentity, nrelation, embedding_size, num_particles=num_p)
+    model = TLQE(nentity, nrelation, embedding_size, num_particles=num_p)
 
     print("create model")
     model.cuda()
@@ -1229,10 +1934,7 @@ def test_dataloading_new(data_path="../data/FB15k-237-betae"):
         log_of_the_step = model.train_step(model, new_iterator, optimizer, use_apex)
         print(log_of_the_step)
 
-        if query_name_dict[query_structure] in ["1p", "2p", "3p", "2i", "3i"]:
-            log_of_the_step = model.train_inv_step(model, new_iterator, optimizer, use_apex)
-            print(log_of_the_step)
-
+        
 
         print("======")
 
@@ -1445,6 +2147,7 @@ def test_entailment_loading(data_path="../data/FB15k-237-q2p"):
 
             print("======")
             break
+
 
 if __name__ == "__main__":
     test_dataloading_new()

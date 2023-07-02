@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=2 python run_beta_benchmark.py \
+CUDA_VISIBLE_DEVICES=6 python run_beta_benchmark_TLQE.py \
 --data_name "NELL-betae" \
 -b 3000 \
 --model_name "v00.02" \

@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=1 python run_beta_benchmark.py \
+CUDA_VISIBLE_DEVICES=4 python run_beta_benchmark_TLQE.py \
 --data_name "FB15k-betae" \
 -b 8192 \
 --model_name "v00.00" \
